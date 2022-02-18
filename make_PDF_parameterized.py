@@ -53,7 +53,7 @@ def main(argv):
     e_min = 0
     e_max = 70
     nbin_en = int((e_max - e_min)/e_binwidth)
-    nbin_cosangle = 20
+    nbin_cosangle = 100
     cosangle_binwidth = 2 / nbin_cosangle
     pdf = np.zeros([nbin_en, nbin_cosangle])
     for e in tqdm(tree, total=tree.GetEntries()):
@@ -74,11 +74,11 @@ def main(argv):
     #     print("WARNING: PDF has zero bins. This may result in log(0) down the line...", file=sys.stderr)
     # np.where(pdf==0, pdf, 0.0001)
     # Do the fit
-    bin_right_edge = np.linspace(-1, 1, num=nbin_cosangle) + 2/nbin_cosangle # X axis of fit
+    fit_x = np.linspace(-1, 1, num=nbin_cosangle) + 2/nbin_cosangle/2 # X axis of fit
     NParams = 5
     params = np.zeros((nbin_en, NParams))
     for (i, pdf_slice) in enumerate(pdf):
-        params[i] = fit_bipeak(bin_right_edge, pdf_slice)
+        params[i] = fit_bipeak(fit_x, pdf_slice)
 
     # Format: 
     # Parameterized. Generated from ...
@@ -91,12 +91,12 @@ def main(argv):
     # print(params)
     with open(pdf_filename, 'w') as f:
         f.write(f'# From {file_name}\n')
-        f.write(f'Parameterized {functype}\n')
+        f.write(f'# Parameterized {functype}\n')
         f.write('# Energy min, Energy max, Energy binwidth\n')
         f.write(f'{e_min} {e_max} {e_binwidth}\n')
         f.write('# CosAngle min, CosAngle max\n')
         f.write('-1 1\n\n')
-        np.savetxt(f, pdf)
+        np.savetxt(f, params)
 
 # fit function: 
 def bi_peak_distribution(x, g1, g2, sigma_1, sigma_2, c):
@@ -120,7 +120,7 @@ def fit_bipeak(bin_right_edge, pdf_slice):
     bounds = (np.zeros(p0.shape), np.array([np.inf, np.inf, np.inf, np.inf, 0.1]))
     (params, cov) = curve_fit(bi_peak_distribution, bin_right_edge, pdf_slice, p0, bounds=bounds)
     rms = np.mean((pdf_slice - bi_peak_distribution(bin_right_edge, *params))**2)
-    params = normalize(params)
+    # params = normalize(params)
     if rms > 0.1:
         print("WARNING: LARGE RMS Detected. Current RMS is {rms :.2e}")
     return params

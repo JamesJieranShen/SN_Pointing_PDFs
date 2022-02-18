@@ -50,7 +50,7 @@ def main(argv):
     e_min = 0
     e_max = 70
     nbin_en = int((e_max - e_min)/e_binwidth)
-    nbin_cosangle = 20
+    nbin_cosangle = 100
     cosangle_binwidth = 2 / nbin_cosangle
     pdf = np.zeros([nbin_en, nbin_cosangle])
     for e in tqdm(tree, total=tree.GetEntries()):
@@ -69,7 +69,7 @@ def main(argv):
         pdf[i] = pdf[i] / np.sum(pdf[i])
     # if np.min(pdf) <= 0:
     #     print("WARNING: PDF has zero bins. This may result in log(0) down the line...", file=sys.stderr)
-    # np.where(pdf==0, pdf, 0.0001)
+    pdf = np.where(pdf==0, 0.0001, pdf)
     print(f"Writing to {pdf_filename}...")
     with open(pdf_filename, 'w') as f:
         f.write(f'# Generated from {file_name}\n')
