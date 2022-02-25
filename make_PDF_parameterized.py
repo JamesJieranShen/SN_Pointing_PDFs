@@ -11,6 +11,11 @@ import getopt
 import os
 from tqdm import tqdm, trange
 
+# Custom binning
+# AJ's binning + higher energy bins
+# list(range(10, 80, 10))
+energy_bins = list(range(2, 40, 2)) + [40, 50, 60, 70] 
+
 def main(argv):
     try:
         opts, args = getopt.getopt(argv, 'o:', ['clean', 'radio'])
@@ -49,10 +54,10 @@ def main(argv):
     def charge_to_energy(q): return (q-b)/m
 
     functype = 'exp' # exponential distribution
-    e_binwidth = 10
-    e_min = 0
-    e_max = 70
-    nbin_en = int((e_max - e_min)/e_binwidth)
+    # e_binwidth = 10
+    # e_min = 0
+    # e_max = 70
+    nbin_en = len(energy_bins) + 1
     nbin_cosangle = 100
     cosangle_binwidth = 2 / nbin_cosangle
     pdf = np.zeros([nbin_en, nbin_cosangle])
@@ -60,10 +65,8 @@ def main(argv):
         if e.NTrks == 0:
             continue
         en = charge_to_energy(e.charge_corrected)
-        if en > e_max:
-            continue
         cosAngle = e.truth_nu_dir.Dot(e.reco_e_dir)
-        en_binidx = int((en-e_min)//e_binwidth) if en > 0 else 0
+        en_binidx = np.searchsorted(energy_bins, en)
         cosangle_binidx = int((cosAngle + 1) // cosangle_binwidth)
         pdf[en_binidx, cosangle_binidx] += 1
     # normalize pdf for each energy bin
@@ -92,8 +95,10 @@ def main(argv):
     with open(pdf_filename, 'w') as f:
         f.write(f'# From {file_name}\n')
         f.write(f'# Parameterized {functype}\n')
-        f.write('# Energy min, Energy max, Energy binwidth\n')
-        f.write(f'{e_min} {e_max} {e_binwidth}\n')
+        # f.write('# Energy min, Energy max\n')
+        # f.write(f'{e_min} {e_max}\n')
+        f.write(f'# Energy Bin Left Edges (there is one underflow and overflow bin)\n')
+        np.savetxt(f, [energy_bins], fmt='%.4e')
         f.write('# CosAngle min, CosAngle max\n')
         f.write('-1 1\n\n')
         np.savetxt(f, params)
