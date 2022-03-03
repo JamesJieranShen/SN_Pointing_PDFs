@@ -28,9 +28,10 @@ class PDF(metaclass=ABCMeta):
 class NumericPDF(PDF):
     """Pointing information about a particular type of interaction (such as electron scattering)."""
     name: str
-    energy_min: float
-    energy_max: float
-    energy_bin_width: float
+    # energy_min: float
+    # energy_max: float
+    # energy_bin_width: float
+    energy_binning: np.ndarray
 
     cosAngle_min: float
     cosAngle_max: float
@@ -43,7 +44,8 @@ class NumericPDF(PDF):
 
     def __init__(self, name, energy_binning, cosAngle_binning, pdf, interpolation=None):
         super().__init__(name)
-        (self.energy_min, self.energy_max, self.energy_bin_width) = energy_binning
+        # (self.energy_min, self.energy_max, self.energy_bin_width) = energy_binning
+        self.energy_binning = energy_binning
         (self.cosAngle_min, self.cosAngle_max,
          self.cosAngle_bin_width) = cosAngle_binning
         self.pdf = pdf
@@ -58,10 +60,11 @@ class NumericPDF(PDF):
                                   bounds_error=False, fill_value=None, kind='cubic')
 
     def eval(self, energy, cos_angle):
-        if energy > self.energy_max:
-            return 1.0
-        energy_bin = (energy - self.energy_min) / \
-            self.energy_bin_width if energy > 0 else 0
+        # if energy > self.energy_max:
+        #     return 1.0
+        # energy_bin = (energy - self.energy_min) / \
+        #     self.energy_bin_width if energy > 0 else 0
+        energy_bin = np.searchsorted(self.energy_binning, energy)
         cos_angle_nbins = round(
             (self.cosAngle_max - self.cosAngle_min) / self.cosAngle_bin_width)
         cos_angle_bin = (cos_angle - self.cosAngle_min) / \
@@ -86,7 +89,7 @@ class ParametricPDF(PDF):
     def eval(self, energy, cos_angle):
         #         if energy > self.energy_max:
         #             return 1.0
-        #energy_bin = int((energy - self.energy_min) / self.energy_bin_width) if energy > 0 else 0
+        # energy_bin = int((energy - self.energy_min) / self.energy_bin_width) if energy > 0 else 0
         energy_bin = np.searchsorted(self.energy_binning, energy)
         (g_1, g_2, sigma_1, sigma_2, c) = self.params[energy_bin]
         return g_1 * np.exp(- (cos_angle + 1) / sigma_1) + g_2 * np.exp((cos_angle - 1) / sigma_2) + c

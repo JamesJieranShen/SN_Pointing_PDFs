@@ -51,9 +51,10 @@ def main(argv):
     else:
         m = 259.218
         b = 901.312
+
     def charge_to_energy(q): return (q-b)/m
 
-    functype = 'exp' # exponential distribution
+    functype = 'exp'  # exponential distribution
     # e_binwidth = 10
     # e_min = 0
     # e_max = 70

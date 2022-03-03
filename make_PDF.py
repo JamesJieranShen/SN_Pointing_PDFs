@@ -9,6 +9,11 @@ import os
 from tqdm import tqdm, trange
 from scipy.ndimage import gaussian_filter1d
 
+# Custom binning
+# AJ's binning + higher energy bins
+# list(range(10, 80, 10))
+energy_bins = list(range(2, 40, 2)) + [40, 50, 60, 70]
+
 def main(argv):
     try:
         opts, args = getopt.getopt(argv, 'o:', ['clean', 'radio'])
@@ -44,12 +49,14 @@ def main(argv):
     else:
         m = 259.218
         b = 901.312
+
     def charge_to_energy(q): return (q-b)/m
 
-    e_binwidth = 10
-    e_min = 0
-    e_max = 70
-    nbin_en = int((e_max - e_min)/e_binwidth)
+    # e_binwidth = 10
+    # e_min = 0
+    # e_max = 70
+    # nbin_en = int((e_max - e_min)/e_binwidth)
+    nbin_en = len(energy_bins) + 1
     nbin_cosangle = 100
     cosangle_binwidth = 2 / nbin_cosangle
     pdf = np.zeros([nbin_en, nbin_cosangle])
@@ -57,10 +64,8 @@ def main(argv):
         if e.NTrks == 0:
             continue
         en = charge_to_energy(e.charge_corrected)
-        if en > e_max:
-            continue
         cosAngle = e.truth_nu_dir.Dot(e.reco_e_dir)
-        en_binidx = int((en-e_min)//e_binwidth) if en > 0 else 0
+        en_binidx = np.searchsorted(energy_bins, en)
         cosangle_binidx = int((cosAngle + 1) // cosangle_binwidth)
         pdf[en_binidx, cosangle_binidx] += 1
     # normalize pdf for each energy bin
@@ -69,12 +74,14 @@ def main(argv):
         pdf[i] = pdf[i] / np.sum(pdf[i])
     # if np.min(pdf) <= 0:
     #     print("WARNING: PDF has zero bins. This may result in log(0) down the line...", file=sys.stderr)
-    pdf = np.where(pdf==0, 0.0001, pdf)
+    pdf = np.where(pdf == 0, 0.0001, pdf)
     print(f"Writing to {pdf_filename}...")
     with open(pdf_filename, 'w') as f:
         f.write(f'# Generated from {file_name}\n')
-        f.write('# Energy min, Energy max, Energy binwidth\n')
-        f.write(f'{e_min} {e_max} {e_binwidth}\n')
+        # f.write('# Energy min, Energy max, Energy binwidth\n')
+        # f.write(f'{e_min} {e_max} {e_binwidth}\n')
+        f.write(f'# Energy Bin Left Edges (there is one underflow and overflow bin)\n')
+        np.savetxt(f, [energy_bins], fmt='%.4e')
         f.write('# CosAngle min, CosAngle max, CosAngle binwidth\n')
         f.write(f'-1 1 {cosangle_binwidth}\n\n')
         np.savetxt(f, pdf)
