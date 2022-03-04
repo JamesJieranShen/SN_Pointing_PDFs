@@ -4,12 +4,16 @@ from abc import ABCMeta, abstractmethod
 from scipy.optimize import brute, optimize
 from scipy.interpolate import interp2d
 from scipy.stats import mode
+from scipy.spatial.transform import Rotation
 import ROOT
 import math
 from typing import Callable
 
+from tqdm import tqdm
+
 import numpy as np
 import matplotlib.pyplot as plt
+
 
 # %% PDF definitions
 
@@ -68,7 +72,7 @@ class NumericPDF(PDF):
         cos_angle_nbins = round(
             (self.cosAngle_max - self.cosAngle_min) / self.cosAngle_bin_width)
         cos_angle_bin = (cos_angle - self.cosAngle_min) / \
-            self.cosAngle_bin_width
+                        self.cosAngle_bin_width
         # guard against cosAngle = 1
         cos_angle_bin = min(cos_angle_bin, cos_angle_nbins - 1)
         if self.interpolation == 'linear':
@@ -118,6 +122,7 @@ def load_pdf_parameterized(pdf_path, name=None):
 
     return ParametricPDF(name, energy_binning, params)
 
+
 # %%
 
 
@@ -133,26 +138,71 @@ def charge_to_energy_radio(charge):
     return (charge - b) / m
 
 
-def load_SN_file(filepath, with_radio=False):
+def load_SN_file(filepath, with_radio=False, return_nu_dir=False, show_progress=False):
     file = ROOT.TFile(filepath)
     tree = file.PointResTree.tr
     # nevts = tree.GetEntries()
     energies = []
-    directions = []
+    e_directions = []
+    nu_directions = []
     ievt = 0
     charge_to_energy = charge_to_energy_radio if with_radio else charge_to_energy_clean
-
-    for event in tree:
+    iterable = tqdm(tree, total=tree.GetEntriesFast()) if show_progress else tree
+    for event in iterable:
         if event.NTrks == 0:
             continue
         energies.append(charge_to_energy(event.charge_corrected))
 
-        directions.append([
+        e_directions.append([
             event.reco_e_dir.X(),
             event.reco_e_dir.Y(),
             event.reco_e_dir.Z()
         ])
+        if return_nu_dir:
+            nu_directions.append([
+                event.truth_nu_dir.X(),
+                event.truth_nu_dir.Y(),
+                event.truth_nu_dir.Z()
+            ])
         ievt += 1
+    if return_nu_dir:
+        return np.asarray(energies), np.asarray(e_directions), np.asarray(nu_directions)
+    return np.asarray(energies), np.asarray(e_directions)
+
+
+def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
+    """
+    Draw supernova events from the event files, rotate them to the correct directions.
+    @param sn_event_files: (energy, directions) tuple for the events
+    @param event_counts: number of events to draw from each root file
+    @param truth_dir: the direction of the neutrino to align with
+    @param rng: random number generator. If None, use `rng.random.default_rng()`
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    truth_dir_xyz = sphere_to_xyz(truth_dir)
+    energies = []
+    directions = []
+    for event, count in zip(sn_event_files, event_counts):
+        if count <= 0:
+            continue
+        file_energies, file_e_directions, file_nu_directions = event
+        nevts = file_energies.size
+
+        for _ in range(count):
+            idx = rng.choice(nevts)
+            energies.append(file_energies[idx])
+            raw_e_dir = file_e_directions[idx]
+            raw_sn_dir = file_nu_directions[idx]
+            # do rotation
+            # define a rotation. Rotation is ambiguous since we only need to match one vector. Eliminate ambiguity by
+            # assuming that the direction that is orthogonal to the two SN directions is the rotational axis.
+            sn_orthogonal = np.cross(raw_sn_dir, truth_dir_xyz)  # does not need to be normalized
+            desired_frame = [truth_dir_xyz, sn_orthogonal]
+            raw_frame = [raw_sn_dir, sn_orthogonal]
+            (rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)  # generate rotation raw -> desired
+            rotated_e_dir = rotation.apply(raw_e_dir)
+            directions.append(rotated_e_dir)
     return np.asarray(energies), np.asarray(directions)
 
 
@@ -181,6 +231,7 @@ def xyz_to_sphere(direction):
     theta = np.arctan2(perp, direction_normalized[2])
     return np.asarray([theta, phi])
 
+
 # %%
 
 
@@ -195,26 +246,70 @@ class SupernovaPointing:
     truth_dir: np.ndarray
     default_interpolation_type: str
 
-    def __init__(self, PDFs, sn_event_files, weights=None, with_radio=False):
+    def __init__(self, PDFs, sn_event_files, synthetic=False, synthetic_mixin=0.0, synthetic_counts=None,
+                 poisson_count=False, weights=None, with_radio=False):
         """Class Constructor
         Args:
-            @param PDFs: List of interaction information objects.
-            @param sn_event_files: List of paths to ROOT files associated to each interaction.
+            @param PDFs: List of interaction information objects. If synthetic is set to False, the number of PDFs must
+                        be the same as the number of sn_event_files. If synthetic is set to True, only the interactions
+                        specified by the PDFs will be used. The other channels may be mixed in (see synthetic_mixin).
+            @param sn_event_files: If synthetic is set to false, list of paths to ROOT files associated to each
+                    interaction. all events in the listed files will be considered part of the supernova event.
+                    Otherwise, this is a list of tuples (energy, direction).
+                    events will be drawn from each file according to synthetic_counts.
+            @param synthetic: If True, synthesize supernova events by drawing events from a large pool of events.
+            @param synthetic_mixin: Ratio of events from other interactions to mix in. 0 means all events are from the
+                    desired interaction. 1.0 means events are effectively randomly drawn from all interactions based on
+                    the expected number of events.
+            @param synthetic_counts: number of events to synthesize for each channel. If set to None, use the default
+                    ES/CC counts from SNOWGLOBES.
+            @param poisson_count: If True, interpret synthetic counts as expected values in a poisson distribution.
             @param weights: Weight of each interaction. If None, they are all set to 1. Defaults to None.
         """
+        #Test input lengths
+        if synthetic_counts is None:
+            synthetic_counts = [326, 3455]
+        if synthetic:
+            assert len(PDFs) <= len(sn_event_files) == len(synthetic_counts), \
+                "Using event synthesis, but given file lengths are incorrect."
+
+        if not synthetic:
+            assert len(PDFs) == len(sn_event_files), \
+                "Using simulated SN event files, but given file lengths are incorrect."
         self.PDFs = PDFs
         self.events_per_interaction = []
-        for path in sn_event_files:
-            self.events_per_interaction.append(
-                load_SN_file(path, with_radio=with_radio))
-        self.truth_dir = get_truth_SN_dir(sn_event_files[0])
-        self.weights = [
-            1.0] * len(self.events_per_interaction) if weights is None else weights
+        # Use generated SN events
+        if not synthetic:
+            self.truth_dir = get_truth_SN_dir(sn_event_files[0])
+            for path in sn_event_files:
+                self.events_per_interaction.append(
+                    load_SN_file(path, with_radio=with_radio))
+        else:  # synthesize SN events from a large pool of data (from the PDF root files, for example)
+            rng = np.random.default_rng()
+            # Randomly select a truth direction.
+            self.truth_dir = np.array([rng.uniform(0, np.pi), rng.uniform(-np.pi, np.pi)])
+
+            if poisson_count:
+                synthetic_counts = rng.poisson(synthetic_counts)
+            for interaction_id, pdf in enumerate(PDFs):
+                count = synthetic_counts[interaction_id]
+                pure_counts = rng.binomial(count, 1 - synthetic_mixin)  # number of events that is in the correct
+                # construct a list of how many events to draw from each interaction
+                # Draws from a distribution defined by pvals, with a sum of count - pure_counts
+                event_counts = rng.multinomial(count - pure_counts,
+                                               pvals=synthetic_counts / np.sum(synthetic_counts))
+                # Then add in the pure events
+                event_counts[interaction_id] += pure_counts
+                print(event_counts)
+                self.events_per_interaction.append(
+                    draw_events(sn_event_files, event_counts, self.truth_dir, rng))
+
+        self.weights = [1.0] * len(self.events_per_interaction) if weights is None else weights
 
     def loss(self, sn_dir, weighting_factor=0, zero_bin=1e-4):
         """
 
-        @param sn_dir: supernova direction, in form (theta, phi)
+        @param sn_dir: guessed supernova direction, in form (theta, phi)
         @param weighting_factor: a linear weighting factor. Positive value biases higher energy bins. 0 means equal
         weighting.
         @param zero_bin: values to treat zero as (in preventing log(0)).
@@ -233,7 +328,7 @@ class SupernovaPointing:
                     continue
                 pdf_value = pdf.eval(energy, cos_angle)
                 # weighting formula is 1 + w * energy/100. Weight = 1 means 100MeV is doubly weighted
-                pdf_value *= (1 + (energy/100) * weighting_factor)
+                pdf_value *= (1 + (energy / 100) * weighting_factor)
                 interaction_loss -= np.log(pdf_value)
             loss += interaction_loss * weight
         return loss
@@ -242,9 +337,9 @@ class SupernovaPointing:
         for events in self.events_per_interaction:
             directions = events[1][events[0] > energy_cutoff]
             width = 0.05
-            bins = np.floor(directions/width)
+            bins = np.floor(directions / width)
             # print(mode(bins).mode)
-            dir_xyz = mode(bins).mode.flatten()*width
+            dir_xyz = mode(bins).mode.flatten() * width
             return xyz_to_sphere(dir_xyz)
 
     def high_energy_event_direction(self, votes=10):
@@ -258,9 +353,10 @@ class SupernovaPointing:
                 directions.append(direction)
             directions = np.asarray(directions)
             width = 0.25
-            bins = np.floor(directions/width)
-            dir_xyz = mode(bins).mode.flatten()*width
+            bins = np.floor(directions / width)
+            dir_xyz = mode(bins).mode.flatten() * width
             return xyz_to_sphere(dir_xyz)
+
 
 # %%
 
@@ -273,7 +369,7 @@ def error(pointer: SupernovaPointing, result, full_output=False, unit='deg'):
         x0 = result
 
     angle = np.arccos(sphere_to_xyz(pointer.truth_dir).dot(sphere_to_xyz(x0)))
-    return angle if unit == 'rad' else angle*180/np.pi
+    return angle if unit == 'rad' else angle * 180 / np.pi
 
 
 def details(pointer: SupernovaPointing, result: tuple):
@@ -292,6 +388,6 @@ def details(pointer: SupernovaPointing, result: tuple):
     plt.xlabel(r'$\phi$')
     plt.ylabel(r'$\theta$')
     dot = sphere_to_xyz(pointer.truth_dir).dot(sphere_to_xyz(x0))
-
+    plt.show()
     # return degree deviation between minimization and truth
-    return np.arccos(dot)*180/np.pi
+    return np.arccos(dot) * 180 / np.pi
