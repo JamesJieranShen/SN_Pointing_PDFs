@@ -15,9 +15,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# This file declares many utilities that can be used to reconstruct SN directions. In particular:
+# - offers infrastructures to generated PDFs for each interaction channels.
+# - utility functions to read PointResTree Root files.
+# - A class for reconstructing SN direction, given PDFs and events.
+
 # %% PDF definitions
-
-
 class PDF(metaclass=ABCMeta):
     name: str
 
@@ -47,21 +50,32 @@ class NumericPDF(PDF):
     pdf_cubic: Callable
 
     def __init__(self, name, energy_binning, cosAngle_binning, pdf, interpolation=None):
+        """
+        Constructor
+        @param name: name of the interaction
+        @param energy_binning: bin edges for the energy bins. It is assumed that there is one overflow bin and one
+        underflow bin.
+        @param cosAngle_binning: (min, max, width) for cos(angle) binning.
+        @param pdf: pdf data. If xscns = None, consider the entire input to be one PDF. If xscns is an array,
+        consider this to be a list of pdfs, and mix according to the given cross-section ratio.
+        @param interpolation: interpolation method. Can be None (no interpolation), 'linear', or 'cubic'.
+        """
         super().__init__(name)
         # (self.energy_min, self.energy_max, self.energy_bin_width) = energy_binning
         self.energy_binning = energy_binning
-        (self.cosAngle_min, self.cosAngle_max,
-         self.cosAngle_bin_width) = cosAngle_binning
-        self.pdf = pdf
+        (self.cosAngle_min, self.cosAngle_max, self.cosAngle_bin_width) = cosAngle_binning
+        self.pdf = np.array(pdf, copy=True)
         assert interpolation in (None, 'linear', 'cubic'), print(
             "Interpolation modes are None, linear, cubic")
         self.interpolation = interpolation
         energy_coords = np.arange(0, len(pdf))
         cos_angle_coords = np.arange(0, len(pdf[0]))
-        self.pdf_linear = interp2d(energy_coords, cos_angle_coords, np.transpose(pdf),
-                                   bounds_error=False, fill_value=None, kind='linear')
-        self.pdf_cubic = interp2d(energy_coords, cos_angle_coords, np.transpose(pdf),
-                                  bounds_error=False, fill_value=None, kind='cubic')
+
+        if interpolation is not None:
+            self.pdf_linear = interp2d(energy_coords, cos_angle_coords, np.transpose(pdf),
+                                       bounds_error=False, fill_value=None, kind='linear')
+            self.pdf_cubic = interp2d(energy_coords, cos_angle_coords, np.transpose(pdf),
+                                      bounds_error=False, fill_value=None, kind='cubic')
 
     def eval(self, energy, cos_angle):
         # if energy > self.energy_max:
@@ -123,20 +137,7 @@ def load_pdf_parameterized(pdf_path, name=None):
     return ParametricPDF(name, energy_binning, params)
 
 
-# %%
-
-
-def charge_to_energy_clean(charge):
-    m = 259.218
-    b = 901.312
-    return (charge - b) / m
-
-
-def charge_to_energy_radio(charge):
-    m = 248.111
-    b = 2161.06
-    return (charge - b) / m
-
+# %% ROOT related methods
 
 def load_SN_file(filepath, with_radio=False, return_nu_dir=False, show_progress=False):
     file = ROOT.TFile(filepath)
@@ -170,6 +171,45 @@ def load_SN_file(filepath, with_radio=False, return_nu_dir=False, show_progress=
     return np.asarray(energies), np.asarray(e_directions)
 
 
+def get_truth_SN_dir(filepath):
+    file = ROOT.TFile(filepath)
+    tree = file.PointResTree.tr
+    for event in tree:
+        return np.array([event.truth_nu_dir.Theta(), event.truth_nu_dir.Phi()])
+
+
+# %% Other Utility Functions
+def charge_to_energy_clean(charge):
+    m = 259.218
+    b = 901.312
+    return (charge - b) / m
+
+
+def charge_to_energy_radio(charge):
+    m = 248.111
+    b = 2161.06
+    return (charge - b) / m
+
+def sphere_to_xyz(direction):
+    # [theta, phi] -> [x, y, z]
+    return np.array([
+        math.sin(direction[0]) * math.cos(direction[1]),
+        math.sin(direction[0]) * math.sin(direction[1]),
+        math.cos(direction[0])
+    ])
+
+
+def xyz_to_sphere(direction):
+    # [x, y, z] => [theta, phi]
+    # Identical to TVector3.Theta(), TVector3.Phi()
+    direction_normalized = np.asarray(direction / np.linalg.norm(direction))
+    phi = np.arctan2(direction_normalized[1], direction_normalized[0])
+    perp = np.linalg.norm(direction_normalized[:2])
+    theta = np.arctan2(perp, direction_normalized[2])
+    return np.array([theta, phi])
+
+
+# %% SN_Pointer Class and its helpers
 def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
     """
     Draw supernova events from the event files, rotate them to the correct directions.
@@ -203,37 +243,7 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
             (rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)  # generate rotation raw -> desired
             rotated_e_dir = rotation.apply(raw_e_dir)
             directions.append(rotated_e_dir)
-    return np.asarray(energies), np.asarray(directions)
-
-
-def get_truth_SN_dir(filepath):
-    file = ROOT.TFile(filepath)
-    tree = file.PointResTree.tr
-    for event in tree:
-        return np.array([event.truth_nu_dir.Theta(), event.truth_nu_dir.Phi()])
-
-
-def sphere_to_xyz(direction):
-    # [theta, phi] -> [x, y, z]
-    return np.array([
-        math.sin(direction[0]) * math.cos(direction[1]),
-        math.sin(direction[0]) * math.sin(direction[1]),
-        math.cos(direction[0])
-    ])
-
-
-def xyz_to_sphere(direction):
-    # [x, y, z] => [theta, phi]
-    # Identical to TVector3.Theta(), TVector3.Phi()
-    direction_normalized = np.asarray(direction / np.linalg.norm(direction))
-    phi = np.arctan2(direction_normalized[1], direction_normalized[0])
-    perp = np.linalg.norm(direction_normalized[:2])
-    theta = np.arctan2(perp, direction_normalized[2])
-    return np.asarray([theta, phi])
-
-
-# %%
-
+    return np.array(energies), np.array(directions)
 
 class SupernovaPointing:
     """Class used to hold information about each supernova, and generate its loss function.
@@ -266,7 +276,7 @@ class SupernovaPointing:
             @param poisson_count: If True, interpret synthetic counts as expected values in a poisson distribution.
             @param weights: Weight of each interaction. If None, they are all set to 1. Defaults to None.
         """
-        #Test input lengths
+        # Test input lengths
         if synthetic_counts is None:
             synthetic_counts = [326, 3455]
         if synthetic:
@@ -300,7 +310,7 @@ class SupernovaPointing:
                                                pvals=synthetic_counts / np.sum(synthetic_counts))
                 # Then add in the pure events
                 event_counts[interaction_id] += pure_counts
-                print(event_counts)
+                # print(event_counts)
                 self.events_per_interaction.append(
                     draw_events(sn_event_files, event_counts, self.truth_dir, rng))
 
@@ -358,8 +368,7 @@ class SupernovaPointing:
             return xyz_to_sphere(dir_xyz)
 
 
-# %%
-
+# %% Monitoring/Visualization methods
 
 def error(pointer: SupernovaPointing, result, full_output=False, unit='deg'):
     assert unit in ['rad', 'deg'], "Unit must be deg or rad."
