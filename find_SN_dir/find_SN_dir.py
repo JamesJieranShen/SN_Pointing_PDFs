@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 import numpy as np
 import matplotlib.pyplot as plt
+import healpy as hp
 
 
 # This file declares many utilities that can be used to reconstruct SN directions. In particular:
@@ -190,6 +191,7 @@ def charge_to_energy_radio(charge):
     b = 2161.06
     return (charge - b) / m
 
+
 def sphere_to_xyz(direction):
     # [theta, phi] -> [x, y, z]
     return np.array([
@@ -210,6 +212,23 @@ def xyz_to_sphere(direction):
 
 
 # %% SN_Pointer Class and its helpers
+def get_expected_counts(xscns, confusion_matrix, channel_id_list=None):
+    """
+    Generate expected counts for selected pointing channels.
+    @param channel_id_list: index of the interactions that we generate weights for. If None, assume all channels are
+    used.
+    @param xscns: total numbers of expected events for each interaction.
+    @param confusion_matrix: Confusion matrix of the interactions. element [i, j] represent the number of events in
+    interaction i that is identified as character j. Each row of the confusion matrix should be normalized (divided
+    by their total cross-section). However, the sum might not be zero, if detection efficiency is not perfect.
+    @return: A matrix of expected counts. expected_counts[i][j] is the expected number of
+            events in interaction j that is present in channel i.
+    """
+    total_expected_count = (np.diag(xscns) @ confusion_matrix).T
+    if channel_id_list is None:
+        return total_expected_count
+    return np.array(total_expected_count[np.asarray(channel_id_list)])
+
 def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
     """
     Draw supernova events from the event files, rotate them to the correct directions.
@@ -245,106 +264,108 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
             directions.append(rotated_e_dir)
     return np.array(energies), np.array(directions)
 
+
 class SupernovaPointing:
     """Class used to hold information about each supernova, and generate its loss function.
+    The class takes truth files for different interactions, and conducts maximum likelihood fitting to reconstructed
+    channels. The number of events from each interaction to each channel is described using a matrix of expected counts.
     """
     # Parallel list corresponding to each type of interaction
     PDFs: list[PDF]
     # tuple is [energy, direction]
-    events_per_interaction: list[tuple[np.ndarray, np.ndarray]]
-    weights: list[float]
+    events_per_channel: list[tuple[np.ndarray, np.ndarray]]
+    channel_weights: list[float]
     truth_dir: np.ndarray
+    expected_counts_normalized: np.ndarray
+    is_pure: bool
     default_interpolation_type: str
 
-    def __init__(self, PDFs, sn_event_files, synthetic=False, synthetic_mixin=0.0, synthetic_counts=None,
-                 poisson_count=False, weights=None, with_radio=False):
+    def __init__(self, PDFs, sn_event_files,
+                 synthetic=False, expected_counts=None,
+                 poisson_count=False, channel_weights=None, with_radio=False, sn_dir=None):
         """Class Constructor
         Args:
-            @param PDFs: List of interaction information objects. If synthetic is set to False, the number of PDFs must
-                        be the same as the number of sn_event_files. If synthetic is set to True, only the interactions
-                        specified by the PDFs will be used. The other channels may be mixed in (see synthetic_mixin).
+            @param PDFs: List of interaction information objects. The number of PDFs must be the same as the number
+                        of sn_event_files.
             @param sn_event_files: If synthetic is set to false, list of paths to ROOT files associated to each
                     interaction. all events in the listed files will be considered part of the supernova event.
                     Otherwise, this is a list of tuples (energy, direction).
                     events will be drawn from each file according to synthetic_counts.
-            @param synthetic: If True, synthesize supernova events by drawing events from a large pool of events.
-            @param synthetic_mixin: Ratio of events from other interactions to mix in. 0 means all events are from the
-                    desired interaction. 1.0 means events are effectively randomly drawn from all interactions based on
-                    the expected number of events.
-            @param synthetic_counts: number of events to synthesize for each channel. If set to None, use the default
-                    ES/CC counts from SNOWGLOBES.
+            @param synthetic: If True, synthesize supernova events by drawing events from a large pool of events. If
+            false, all events will be used.
+            @param expected_counts: A matrix of expected counts. expected_counts[i][j] is the expected number of
+            events in interaction j that is present in channel i. In the non-synthetic case, this matrix is
+            considered to be diagonal (all events are pure).
             @param poisson_count: If True, interpret synthetic counts as expected values in a poisson distribution.
-            @param weights: Weight of each interaction. If None, they are all set to 1. Defaults to None.
+            @param channel_weights: Weight of each channel. If None, they are all set to 1. Defaults to None.
+            @param sn_dir: set a fixed supernova direction. Default to None (randomly select direction).
         """
-        # Test input lengths
-        if synthetic_counts is None:
-            synthetic_counts = [326, 3455]
         if synthetic:
-            assert len(PDFs) <= len(sn_event_files) == len(synthetic_counts), \
-                "Using event synthesis, but given file lengths are incorrect."
-
+            if channel_weights is None:
+                channel_weights = [1.0] * len(expected_counts)
+            assert (len(PDFs) == len(sn_event_files) == len(expected_counts[0])) \
+                and (len(channel_weights) == len(expected_counts)), \
+                "Inputs do not agree on correct number of channels and interactions"
         if not synthetic:
-            assert len(PDFs) == len(sn_event_files), \
-                "Using simulated SN event files, but given file lengths are incorrect."
+            channel_weights = [1.0] * len(PDFs)
+            expected_counts = np.identity(len(PDFs))
+        self.is_pure = synthetic  # Could also check if synthetic cases are diagonal
         self.PDFs = PDFs
-        self.events_per_interaction = []
+        self.events_per_channel = []
+        self.channel_weights = channel_weights
+        self.expected_counts_normalized = np.array(expected_counts, copy=True, dtype=float)
+
         # Use generated SN events
         if not synthetic:
             self.truth_dir = get_truth_SN_dir(sn_event_files[0])
             for path in sn_event_files:
-                self.events_per_interaction.append(
+                self.events_per_channel.append(
                     load_SN_file(path, with_radio=with_radio))
         else:  # synthesize SN events from a large pool of data (from the PDF root files, for example)
             rng = np.random.default_rng()
             # Randomly select a truth direction.
-            self.truth_dir = np.array([rng.uniform(0, np.pi), rng.uniform(-np.pi, np.pi)])
-
+            self.truth_dir = np.array([rng.uniform(0, np.pi), rng.uniform(-np.pi, np.pi)]) if sn_dir is None else np.array(sn_dir)
             if poisson_count:
-                synthetic_counts = rng.poisson(synthetic_counts)
-            for interaction_id, pdf in enumerate(PDFs):
-                count = synthetic_counts[interaction_id]
-                pure_counts = rng.binomial(count, 1 - synthetic_mixin)  # number of events that is in the correct
-                # construct a list of how many events to draw from each interaction
-                # Draws from a distribution defined by pvals, with a sum of count - pure_counts
-                event_counts = rng.multinomial(count - pure_counts,
-                                               pvals=synthetic_counts / np.sum(synthetic_counts))
-                # Then add in the pure events
-                event_counts[interaction_id] += pure_counts
-                # print(event_counts)
-                self.events_per_interaction.append(
-                    draw_events(sn_event_files, event_counts, self.truth_dir, rng))
+                expected_counts = rng.poisson(expected_counts)
+            for channel_id, counts in enumerate(expected_counts):
+                self.events_per_channel.append(
+                    draw_events(sn_event_files, np.rint(counts).astype(int), self.truth_dir, rng))
+                self.expected_counts_normalized[channel_id] /= np.sum(counts)
 
-        self.weights = [1.0] * len(self.events_per_interaction) if weights is None else weights
-
-    def loss(self, sn_dir, weighting_factor=0, zero_bin=1e-4):
+    def loss(self, sn_dir, zero_bin=1e-4):
         """
 
         @param sn_dir: guessed supernova direction, in form (theta, phi)
-        @param weighting_factor: a linear weighting factor. Positive value biases higher energy bins. 0 means equal
-        weighting.
         @param zero_bin: values to treat zero as (in preventing log(0)).
         @return: negative of log(likelihood)
         """
         sn_dir_xyz = sphere_to_xyz(sn_dir)
         loss = 0
 
-        for pdf, events, weight in zip(self.PDFs, self.events_per_interaction, self.weights):
-            interaction_loss = 0
+        for channel_id, (events, channel_weight, interaction_weights) in \
+                enumerate(zip(self.events_per_channel, self.channel_weights, self.expected_counts_normalized)):
+            channel_loss = 0
             energies = events[0]
             cos_angles = events[1].dot(sn_dir_xyz)
             for energy, cos_angle in zip(energies, cos_angles):
-                # # treat overly energetic events as having the same energy as PDF maxima
                 if energy < 10:
                     continue
-                pdf_value = pdf.eval(energy, cos_angle)
-                # weighting formula is 1 + w * energy/100. Weight = 1 means 100MeV is doubly weighted
-                pdf_value *= (1 + (energy / 100) * weighting_factor)
-                interaction_loss -= np.log(pdf_value)
-            loss += interaction_loss * weight
+                pdf_value = 0.0
+                if self.is_pure:
+                    # If pure, channel is the same thing as interactions
+                    pdf = self.PDFs[channel_id]
+                    pdf_value = pdf.eval(energy, cos_angle)
+                else:  # mixed events
+                    for i, pdf in enumerate(self.PDFs):
+                        pdf_value += pdf.eval(energy, cos_angle) * interaction_weights[i]
+
+                pdf_value = max(pdf_value, zero_bin)
+                channel_loss -= np.log(pdf_value)
+            loss += channel_loss * channel_weight
         return loss
 
     def most_populated_dir(self, energy_cutoff=10):
-        for events in self.events_per_interaction:
+        for events in self.events_per_channel:
             directions = events[1][events[0] > energy_cutoff]
             width = 0.05
             bins = np.floor(directions / width)
@@ -354,7 +375,7 @@ class SupernovaPointing:
 
     def high_energy_event_direction(self, votes=10):
         # Let the highest energy directions vote
-        for events in self.events_per_interaction:
+        for events in self.events_per_channel:
             idxs = np.argpartition(events[0], -votes)[-votes:]
             directions = []
             for idx in idxs:
@@ -384,19 +405,41 @@ def error(pointer: SupernovaPointing, result, full_output=False, unit='deg'):
 def details(pointer: SupernovaPointing, result: tuple):
     assert len(result) == 4, "Expect a 4-long tuple. Is this the full output?"
     # result [x0, fval, grid, jout]
+#     (x0, fval, grid, jout) = result
+#     plt.figure(figsize=(8, 6), dpi=120)
+#     plt.imshow(jout, extent=[-np.pi, np.pi, np.pi, 0],
+#                origin='upper', aspect='auto')
+#     plt.plot(pointer.truth_dir[1], pointer.truth_dir[0],
+#              'r*', label="True Direction")
+#     plt.plot(x0[1], x0[0], 'g*', label='Minimization Result')
+#     plt.colorbar()
+#     plt.legend()
+#     plt.title('Supernova Pointing Result')
+#     plt.xlabel(r'$\phi$')
+#     plt.ylabel(r'$\theta$')
+#     dot = sphere_to_xyz(pointer.truth_dir).dot(sphere_to_xyz(x0))
+#     plt.show()
+#     # return degree deviation between minimization and truth
+#     return np.arccos(dot) * 180 / np.pi
+
+    NSIDE = 16
+    NPIX = hp.nside2npix(NSIDE)
+
     (x0, fval, grid, jout) = result
-    plt.figure(figsize=(8, 6), dpi=120)
-    plt.imshow(jout, extent=[-np.pi, np.pi, np.pi, 0],
-               origin='upper', aspect='auto')
-    plt.plot(pointer.truth_dir[1], pointer.truth_dir[0],
-             'r*', label="True Direction")
-    plt.plot(x0[1], x0[0], 'g*', label='Minimization Result')
-    plt.colorbar()
+    (theta, phi) = grid
+    theta = theta.flatten()
+    phi = phi.flatten()
+    jout = jout.flatten()
+
+    idx = hp.ang2pix(NSIDE, theta, phi)
+    pixels = np.zeros(NPIX)
+    pixels[idx] = jout
+    # pixels = hp.smoothing(pixels, fwhm=np.radians(0.))
+    hp.mollview(pixels, title="Skymap of Neutrino direction", norm='hist')
+    hp.projplot(pointer.truth_dir, 'r*', label="Truth SN Direction")
+    hp.projplot(x0, 'g*', label='Minimization Result')
     plt.legend()
-    plt.title('Supernova Pointing Result')
-    plt.xlabel(r'$\phi$')
-    plt.ylabel(r'$\theta$')
+    hp.graticule()
     dot = sphere_to_xyz(pointer.truth_dir).dot(sphere_to_xyz(x0))
-    plt.show()
-    # return degree deviation between minimization and truth
     return np.arccos(dot) * 180 / np.pi
+
