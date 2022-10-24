@@ -229,13 +229,31 @@ def get_expected_counts(xscns, confusion_matrix, channel_id_list=None):
         return total_expected_count
     return np.array(total_expected_count[np.asarray(channel_id_list)])
 
-def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
+def pre_rotate_events(orig_event_file, standard_dir=np.array([0, 0, 1])):
+    """
+    Rotate all events in `orig_event_file` to have the same neutrino direction.
+    @param standard_dir: The neutrino direction of all output events.
+    @return: The same event format, but with rotated directions.
+    """
+    energies, e_dir, nu_dir = orig_event_file
+    sn_ortho = np.cross(nu_dir, standard_dir)
+    desired_frame = [[standard_dir, orth] for orth in sn_ortho]
+    raw_frame = [[nu_dir[i], sn_ortho[i]] for i in range(len(sn_ortho))]
+
+    rotated_e_dir = np.empty(e_dir.shape)
+    for idx, (raw, desired) in tqdm(enumerate(zip(raw_frame, desired_frame)), total=len(raw_frame)):
+        (rot, _) = Rotation.align_vectors(desired, raw)
+        rotated_e_dir[idx] = rot.apply(e_dir[idx])
+    return [energies, rotated_e_dir, np.array([standard_dir]*len(energies))]
+
+def draw_events(sn_event_files, event_counts, truth_dir, rng=None, pre_rotated=False):
     """
     Draw supernova events from the event files, rotate them to the correct directions.
     @param sn_event_files: (energy, directions) tuple for the events
     @param event_counts: number of events to draw from each root file
     @param truth_dir: the direction of the neutrino to align with
     @param rng: random number generator. If None, use `rng.random.default_rng()`
+    @param pre_rotated: If True, assume input events are pre-rotated to the same direction.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -247,7 +265,12 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
             continue
         file_energies, file_e_directions, file_nu_directions = event
         nevts = file_energies.size
-
+        if pre_rotated:
+            standard_sn_dir = file_nu_directions[0] # Assume every single event in file has the same direction.and
+            ortho = np.cross(standard_sn_dir, truth_dir_xyz)
+            desired_frame = [truth_dir_xyz, ortho]
+            raw_frame = [standard_sn_dir, ortho]
+            (standard_rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)
         for _ in range(count):
             idx = rng.choice(nevts)
             energies.append(file_energies[idx])
@@ -256,11 +279,14 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None):
             # do rotation
             # define a rotation. Rotation is ambiguous since we only need to match one vector. Eliminate ambiguity by
             # assuming that the direction that is orthogonal to the two SN directions is the rotational axis.
-            sn_orthogonal = np.cross(raw_sn_dir, truth_dir_xyz)  # does not need to be normalized
-            desired_frame = [truth_dir_xyz, sn_orthogonal]
-            raw_frame = [raw_sn_dir, sn_orthogonal]
-            (rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)  # generate rotation raw -> desired
-            rotated_e_dir = rotation.apply(raw_e_dir)
+            if pre_rotated:
+                rotated_e_dir = standard_rotation.apply(raw_e_dir)
+            else:
+                sn_orthogonal = np.cross(raw_sn_dir, truth_dir_xyz)  # does not need to be normalized
+                desired_frame = [truth_dir_xyz, sn_orthogonal]
+                raw_frame = [raw_sn_dir, sn_orthogonal]
+                (rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)  # generate rotation raw -> desired
+                rotated_e_dir = rotation.apply(raw_e_dir)
             directions.append(rotated_e_dir)
     return np.array(energies), np.array(directions)
 
@@ -282,7 +308,7 @@ class SupernovaPointing:
 
     def __init__(self, PDFs, sn_event_files,
                  synthetic=False, expected_counts=None,
-                 poisson_count=False, channel_weights=None, with_radio=False, sn_dir=None):
+                 poisson_count=False, channel_weights=None, with_radio=False, sn_dir=None, pre_rotated_files=False):
         """Class Constructor
         Args:
             @param PDFs: List of interaction information objects. The number of PDFs must be the same as the number
@@ -299,6 +325,8 @@ class SupernovaPointing:
             @param poisson_count: If True, interpret synthetic counts as expected values in a poisson distribution.
             @param channel_weights: Weight of each channel. If None, they are all set to 1. Defaults to None.
             @param sn_dir: set a fixed supernova direction. Default to None (randomly select direction).
+            @param pre_rotated_files: If True, assume all input sn_event_files are pre-rotated to have nu direction of
+            (0, 0, 1). This optimizes the event rotation during draw_events.
         """
         if synthetic:
             if channel_weights is None:
@@ -329,7 +357,7 @@ class SupernovaPointing:
                 expected_counts = rng.poisson(expected_counts)
             for channel_id, counts in enumerate(expected_counts):
                 self.events_per_channel.append(
-                    draw_events(sn_event_files, np.rint(counts).astype(int), self.truth_dir, rng))
+                    draw_events(sn_event_files, np.rint(counts).astype(int), self.truth_dir, rng=rng, pre_rotated=pre_rotated_files))
                 self.expected_counts_normalized[channel_id] /= np.sum(counts)
 
     def loss(self, sn_dir, zero_bin=1e-4):
