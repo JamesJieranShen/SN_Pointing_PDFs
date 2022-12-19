@@ -337,7 +337,7 @@ class SupernovaPointing:
         if not synthetic:
             channel_weights = [1.0] * len(PDFs)
             expected_counts = np.identity(len(PDFs))
-        self.is_pure = synthetic  # Could also check if synthetic cases are diagonal
+        self.is_pure = False  # Could also check if synthetic cases are diagonal
         self.PDFs = PDFs
         self.events_per_channel = []
         self.channel_weights = channel_weights
@@ -360,11 +360,12 @@ class SupernovaPointing:
                     draw_events(sn_event_files, np.rint(counts).astype(int), self.truth_dir, rng=rng, pre_rotated=pre_rotated_files))
                 self.expected_counts_normalized[channel_id] /= np.sum(counts)
 
-    def loss(self, sn_dir, zero_bin=1e-4):
+    def loss(self, sn_dir, zero_bin=1e-4, e_thresh=0):
         """
 
         @param sn_dir: guessed supernova direction, in form (theta, phi)
         @param zero_bin: values to treat zero as (in preventing log(0)).
+        @param e_thresh: energy cutoff for events used in fit.
         @return: negative of log(likelihood)
         """
         sn_dir_xyz = sphere_to_xyz(sn_dir)
@@ -376,7 +377,7 @@ class SupernovaPointing:
             energies = events[0]
             cos_angles = events[1].dot(sn_dir_xyz)
             for energy, cos_angle in zip(energies, cos_angles):
-                if energy < 10:
+                if energy < e_thresh:
                     continue
                 pdf_value = 0.0
                 if self.is_pure:
@@ -470,4 +471,6 @@ def details(pointer: SupernovaPointing, result: tuple):
     hp.graticule()
     dot = sphere_to_xyz(pointer.truth_dir).dot(sphere_to_xyz(x0))
     return np.arccos(dot) * 180 / np.pi
+
+
 
