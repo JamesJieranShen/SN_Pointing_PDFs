@@ -1,7 +1,7 @@
-# %%
+#
 from abc import ABCMeta, abstractmethod
 
-from scipy.optimize import brute, optimize
+from scipy.optimize import brute, optimize, fmin
 from scipy.interpolate import interp2d
 from scipy.stats import mode
 from scipy.spatial.transform import Rotation
@@ -21,9 +21,9 @@ import healpy as hp
 # - utility functions to read PointResTree Root files.
 # - A class for reconstructing SN direction, given PDFs and events.
 
-# %% PDF definitions
+# PDF definitions
 class PDF(metaclass=ABCMeta):
-    name: str
+    name: str | None
 
     def __init__(self, name=None):
         self.name = name
@@ -138,7 +138,7 @@ def load_pdf_parameterized(pdf_path, name=None):
     return ParametricPDF(name, energy_binning, params)
 
 
-# %% ROOT related methods
+# ROOT related methods
 
 def load_SN_file(filepath, with_radio=False, return_nu_dir=False, show_progress=False):
     file = ROOT.TFile(filepath)
@@ -179,7 +179,7 @@ def get_truth_SN_dir(filepath):
         return np.array([event.truth_nu_dir.Theta(), event.truth_nu_dir.Phi()])
 
 
-# %% Other Utility Functions
+# Other Utility Functions
 def charge_to_energy_clean(charge):
     m = 259.218
     b = 901.312
@@ -211,7 +211,7 @@ def xyz_to_sphere(direction):
     return np.array([theta, phi])
 
 
-# %% SN_Pointer Class and its helpers
+# SN_Pointer Class and its helpers
 def get_expected_counts(xscns, confusion_matrix, channel_id_list=None):
     """
     Generate expected counts for selected pointing channels.
@@ -272,7 +272,14 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None, pre_rotated=F
             raw_frame = [standard_sn_dir, ortho]
             (standard_rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)
         for _ in range(count):
-            idx = rng.choice(nevts)
+            while True:
+                idx = rng.choice(nevts)
+                nuDir = file_nu_directions[idx]
+                # to probe detector pointing anisotropy, only accept events that are within a limit of the proposed SN
+                # direction.
+                selectionRadius = 10 * np.pi / 180 # deg -> rad
+                if np.dot(nuDir, truth_dir_xyz) > np.cos(selectionRadius):
+                    break
             energies.append(file_energies[idx])
             raw_e_dir = file_e_directions[idx]
             raw_sn_dir = file_nu_directions[idx]
@@ -287,6 +294,8 @@ def draw_events(sn_event_files, event_counts, truth_dir, rng=None, pre_rotated=F
                 raw_frame = [raw_sn_dir, sn_orthogonal]
                 (rotation, rmsd) = Rotation.align_vectors(desired_frame, raw_frame)  # generate rotation raw -> desired
                 rotated_e_dir = rotation.apply(raw_e_dir)
+                random_rotation = Rotation.from_rotvec(truth_dir_xyz * rng.random() * np.pi * 2)
+                rotated_e_dir = random_rotation.apply(rotated_e_dir)
             directions.append(rotated_e_dir)
     return np.array(energies), np.array(directions)
 
@@ -352,7 +361,7 @@ class SupernovaPointing:
         else:  # synthesize SN events from a large pool of data (from the PDF root files, for example)
             rng = np.random.default_rng()
             # Randomly select a truth direction.
-            self.truth_dir = np.array([rng.uniform(0, np.pi), rng.uniform(-np.pi, np.pi)]) if sn_dir is None else np.array(sn_dir)
+            self.truth_dir = np.array([np.arccos(rng.uniform(-1, 1)), rng.uniform(-np.pi, np.pi)]) if sn_dir is None else np.array(sn_dir)
             if poisson_count:
                 expected_counts = rng.poisson(expected_counts)
             for channel_id, counts in enumerate(expected_counts):
@@ -418,7 +427,7 @@ class SupernovaPointing:
             return xyz_to_sphere(dir_xyz)
 
 
-# %% Monitoring/Visualization methods
+# Monitoring/Visualization methods
 
 def error(pointer: SupernovaPointing, result, full_output=False, unit='deg'):
     assert unit in ['rad', 'deg'], "Unit must be deg or rad."
@@ -473,4 +482,41 @@ def details(pointer: SupernovaPointing, result: tuple):
     return np.arccos(dot) * 180 / np.pi
 
 
+def fitSupernovaDirection(SN_pointer: SupernovaPointing, args = (1e-4, 5), gridSearchSize=None, newGridSize=2, workers=1, finish=fmin):
+    """ fitting routine for supernova direction. We use an iterative grid search, with each pass focusing on an
+    increasingly smaller search space, and with higher resolution.
+
+    Args:
+        @param SN_pointer (SupernovaPointing): the pointer class to use for the reconstruction.
+        @param args (tuple, optional): the arguments to pass to the loss function. Defaults to (1e-4, 5).
+        @param gridSearchSize (_type_, optional): The grid density for each search pass. If an integer is provided,
+            assume a single-pass grid search using the given grid density. If a list is provided, assume each index is
+            the grid density of each pass. Defaults to [10, 20] (1st pass with 10 grid points, 2nd pass with 20 grid
+            points).
+        @param newGridSize (int, optional): For the next grid search pass, the new grid size is defined by the previous
+            size of each grid unit, times this parameter on each side. Defaults to 2.
+        @param workers (int, optional): Number of CPU cores to use for the grid search. Defaults to 1. When simulating
+            multiple supernovae, it is recommended to use a value of 1 and run N independent supernova reconstructions
+            in parallel.
+        @param finish (_type_, optional): the final refinement function, ran after the last grid search pass. Defaults to scipy.optimize.fmin (simplex algorithm).
+    """    
+    if gridSearchSize is None:
+        gridSearchSize = [10, 20]
+    if isinstance(gridSearchSize, int):
+        gridSearchSize = [gridSearchSize]
+    thetaRange = [0, np.pi]
+    phiRange = [-np.pi, np.pi]
+    for nPass, gridSize in enumerate(gridSearchSize):
+        dTheta = (thetaRange[1] - thetaRange[0]) / gridSize
+        dPhi = (phiRange[1] - phiRange[0]) / gridSize
+        if nPass == len(gridSearchSize) - 1:
+            # last pass, use the finish function
+            finishFunction=finish
+        else:
+            finishFunction=None
+        res = brute(SN_pointer.loss, ranges=[thetaRange, phiRange], args=args, Ns=gridSize, full_output=False, finish=finishFunction, workers=workers)
+        thetaRange = [res[0] - dTheta * newGridSize, res[0] + dTheta * newGridSize]
+        phiRange = [res[1] - dPhi * newGridSize, res[1] + dPhi * newGridSize]
+    return res
+    
 
